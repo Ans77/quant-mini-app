@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: quant-mini-app
+    runtime: python
+    buildCommand: "python3 -m py_compile quant_proxy_server.py"
+    startCommand: "python3 quant_proxy_server.py"
+    healthCheckPath: "/"

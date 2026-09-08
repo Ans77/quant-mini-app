@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=量化小程序
+Comment=启动量化小程序本机服务
+Terminal=true
+Exec=sh -c 'cd "$(dirname "$0")" && exec ./start-quant-app.sh' %k
+Icon=utilities-terminal
+Categories=Office;Finance;
