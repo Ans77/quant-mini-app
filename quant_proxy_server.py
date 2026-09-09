@@ -11,6 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -19,6 +20,7 @@ HTML_FILE = os.path.join(ROOT, "quant-mini-app.html")
 TOKEN = "D43BF722C8E33BFB4CCDD645719E5169"
 CACHE_FILE = os.path.join(ROOT, "quant_universe_cache.json")
 UNIVERSE_CACHE = {"time": 0, "rows": []}
+STAGE_CACHE = {}
 EASTMONEY_CLIST_HOSTS = [
     "https://push2delay.eastmoney.com/api/qt/clist/get",
     "https://push2.eastmoney.com/webguest/api/qt/clist/get",
@@ -934,6 +936,50 @@ def classify_money_type(change_pct, amount, volume, market_value, tail_proxy):
     return label, confidence, "；".join(reasons[:3])
 
 
+def stage_from_daily(rows):
+    closes = [parse_float(row.get("close")) for row in rows]
+    closes = [value for value in closes if isinstance(value, (int, float)) and value > 0]
+    if len(closes) < 160:
+        return {"stageNo": 0, "label": "阶段数据不足"}
+    weekly = closes[-260:]
+    weekly = [weekly[index] for index in range(4, len(weekly), 5)]
+    if len(weekly) < 30:
+        return {"stageNo": 0, "label": "阶段数据不足"}
+    last = weekly[-1]
+    wma30 = sum(weekly[-30:]) / 30
+    previous_wma30 = sum(weekly[-34:-4]) / 30 if len(weekly) >= 34 else wma30
+    slope = wma30 / previous_wma30 - 1 if previous_wma30 else 0
+    high20 = max(weekly[-20:]) if len(weekly) >= 20 else last
+    low20 = min(weekly[-20:]) if len(weekly) >= 20 else last
+    ret13 = last / weekly[-14] - 1 if len(weekly) >= 14 else 0
+    drawdown20 = last / high20 - 1 if high20 else 0
+    tight_base = high20 > low20 and high20 / low20 - 1 < 0.28
+    above_wma = last > wma30
+    breakout = last > high20 * 1.01
+    if above_wma and slope > 0.012 and (breakout or ret13 > 0.08):
+        return {"stageNo": 2, "label": "第二阶段 上升"}
+    if not above_wma and abs(slope) <= 0.025 and tight_base:
+        return {"stageNo": 1, "label": "第一阶段 筑底"}
+    if above_wma and (slope <= 0.012 or drawdown20 < -0.08):
+        return {"stageNo": 3, "label": "第三阶段 筑顶"}
+    if not above_wma and slope < -0.012:
+        return {"stageNo": 4, "label": "第四阶段 下跌"}
+    return {"stageNo": 0, "label": "过渡阶段"}
+
+
+def enrich_stage(item):
+    symbol = item.get("symbol") or ""
+    cached = STAGE_CACHE.get(symbol)
+    if cached and time.time() - cached.get("time", 0) < 300:
+        return cached.get("stage") or {"stageNo": 0, "label": "阶段未识别"}
+    try:
+        stage = stage_from_daily(eastmoney_daily(symbol))
+    except Exception:
+        stage = {"stageNo": 0, "label": "阶段未识别"}
+    STAGE_CACHE[symbol] = {"time": time.time(), "stage": stage}
+    return stage
+
+
 def market_fund_flow_board(limit=20, market="cn"):
     universe = a_share_universe(limit=10000, market=market, use_cache=False)
     rows = []
@@ -995,6 +1041,15 @@ def market_fund_flow_board(limit=20, market="cn"):
     rows.sort(key=lambda item: (item.get("score") or 0, item.get("amount") or 0, item.get("changePct") or 0), reverse=True)
     strong = rows[:limit]
     weak = sorted(rows, key=lambda item: (item.get("score") or 0, item.get("amount") or 0, item.get("changePct") or 0))[:limit]
+    stage_items = {item.get("symbol"): item for item in strong + weak if item.get("symbol")}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(enrich_stage, item): symbol for symbol, item in stage_items.items()}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                stage_items[symbol]["stage"] = future.result()
+            except Exception:
+                stage_items[symbol]["stage"] = {"stageNo": 0, "label": "阶段未识别"}
     return {
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "scope": "all" if market == "all" else "cn",
