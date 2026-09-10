@@ -3598,6 +3598,9 @@
     }
 
     function startAppMessage() {
+      if (location.protocol.startsWith("http") && !["127.0.0.1", "localhost"].includes(location.hostname)) {
+        return "正在连接网页行情服务，请稍候刷新";
+      }
       return "实时行情需要用“双击启动版”打开：start-quant-app.command。不要直接打开 HTML 文件。";
     }
 
@@ -3969,6 +3972,11 @@
     }
 
     async function probeLocalApi() {
+      // 云端部署时，网页和行情代理使用同一个地址，直接调用当前页面的 API。
+      if (location.protocol.startsWith("http") && !["127.0.0.1", "localhost"].includes(location.hostname)) {
+        state.apiBase = "";
+        return true;
+      }
       if (state.apiBase || isCurrentLocalAppServer()) {
         state.apiBase = isCurrentLocalAppServer() ? "" : state.apiBase;
         return true;
