@@ -1551,6 +1551,12 @@
           </div>
           <button id="fundFlowBtn" class="secondary wide-button" type="button">主力资金流向</button>
           <div class="tool-row">
+            <label for="fundBoardMarketSelect">股票范围</label>
+            <select id="fundBoardMarketSelect" aria-label="主力资金股票范围">
+              <option value="cn">主板</option>
+              <option value="nonmain">非主板</option>
+              <option value="all">全部</option>
+            </select>
             <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)">
               <input id="fundBoardAuto" type="checkbox" />
               自动刷新
@@ -1947,6 +1953,7 @@
       fundBoardCountdownTimer: null,
       fundBoardEnabled: true,
       fundBoardInterval: 30,
+      fundBoardMarket: loadSaved("quant_fundboard_market", "cn"),
       fundBoardUpdatedAt: 0,
       fundBoardNextRefreshAt: 0,
       fundBoardRefreshing: false,
@@ -1961,6 +1968,9 @@
       activeEventTheme: null,
       sectorRotation: null,
       sectorRotationMode: "gainers",
+      sectorAutoRefresh: true,
+      sectorRotationTimer: null,
+      sectorRotationRefreshing: false,
       recommendations: [],
       recommendRunning: false,
       recommendCancel: false,
@@ -2216,7 +2226,7 @@
         history.pushState({ page: route }, "", url.href);
       }
       if (id === "viewSectorRotation" && !state.sectorRotation) {
-        void refreshSectorRotation(true);
+        void runSectorRotationRefresh(true);
       }
     }
 
@@ -3679,7 +3689,16 @@
     function renderFundBoardConfig() {
       $("fundBoardAuto").checked = Boolean(state.fundBoardEnabled);
       $("fundBoardInterval").value = String(state.fundBoardInterval || 30);
+      $("fundBoardMarketSelect").value = ["cn", "nonmain", "all"].includes(state.fundBoardMarket) ? state.fundBoardMarket : "cn";
       updateFundBoardCountdown();
+    }
+
+    function fundBoardMarketLabel(market = state.fundBoardMarket) {
+      return {
+        cn: "主板",
+        nonmain: "非主板",
+        all: "全部"
+      }[market] || "主板";
     }
 
     function updateFundBoardCountdown() {
@@ -3716,7 +3735,7 @@
 
     function scheduleFundBoardNextRefresh() {
       if (state.fundBoardTimer) window.clearTimeout(state.fundBoardTimer);
-      if (!state.fundBoardEnabled || !isLocalAppServer()) {
+      if (!state.fundBoardEnabled || !canAutoRefreshData()) {
         state.fundBoardTimer = null;
         state.fundBoardNextRefreshAt = 0;
         updateFundBoardCountdown();
@@ -3731,7 +3750,7 @@
       if (state.fundBoardTimer) window.clearTimeout(state.fundBoardTimer);
       if (state.fundBoardCountdownTimer) window.clearInterval(state.fundBoardCountdownTimer);
       if (!state.fundBoardEnabled) return;
-      if (!isLocalAppServer()) return;
+      if (!canAutoRefreshData()) return;
       if (save) {
         saveSaved("quant_fundboard_enabled", true);
         saveSaved("quant_fundboard_interval", state.fundBoardInterval);
@@ -3942,6 +3961,10 @@
 
     function isLocalAppServer() {
       return Boolean(state.apiBase) || isCurrentLocalAppServer();
+    }
+
+    function canAutoRefreshData() {
+      return isLocalAppServer() || (location.protocol.startsWith("http") && !isCurrentLocalAppServer());
     }
 
     function apiUrl(path) {
@@ -4984,8 +5007,8 @@
 
     async function fetchMarketFlowContext() {
       if (!await probeLocalApi()) return null;
-      const scope = selectedRecommendationMarket();
-      const payload = await fetchJson(apiUrl(`/api/fundboard?market=${encodeURIComponent(scope)}&limit=20&_ts=${Date.now()}`), "主力资金流向");
+      const scope = state.fundBoardMarket || "cn";
+      const payload = await fetchJson(apiUrl(`/api/fundboard?market=${encodeURIComponent(scope)}&limit=50&_ts=${Date.now()}`), "主力资金流向");
       return payload.data || null;
     }
 
@@ -4999,7 +5022,7 @@
       const listNode = $("sectorRotationList");
       if (!listNode) return;
       if (!data) {
-        $("sectorRotationSummary").textContent = "点击刷新后读取板块涨跌和资金流向。";
+        $("sectorRotationSummary").textContent = "正在读取板块涨跌和资金流向，读取后每30秒自动刷新。";
         listNode.innerHTML = `<div class="sector-compare-grid"><div class="sector-column"><div class="sector-row"><div></div><div class="sector-reason">暂无板块数据</div></div></div></div>`;
         return;
       }
@@ -5008,7 +5031,7 @@
       const allRows = sourceRows.slice();
       $("sectorGainBtn").classList.toggle("active", mode === "gainers");
       $("sectorLossBtn").classList.toggle("active", mode === "losers");
-      $("sectorRotationSummary").textContent = `${data.source || "公开行情"}，共读取 ${data.count || allRows.length} 个板块，更新时间 ${data.time || "-"}`;
+      $("sectorRotationSummary").textContent = `${data.source || "公开行情"}，共读取 ${data.count || allRows.length} 个板块，更新时间 ${data.time || "-"}；每30秒自动刷新`;
       const signedDirection = mode === "losers" ? -1 : 1;
       const eastmoneyRows = allRows.slice(0, 10);
       const thsRows = allRows.slice().sort((a, b) => {
@@ -5069,6 +5092,32 @@
         if (!silent) $("statusText").textContent = `板块轮动失败：${error.message}`;
         return null;
       }
+    }
+
+    function scheduleSectorRotationRefresh() {
+      if (state.sectorRotationTimer) window.clearTimeout(state.sectorRotationTimer);
+      if (!state.sectorAutoRefresh || !canAutoRefreshData()) {
+        state.sectorRotationTimer = null;
+        return;
+      }
+      state.sectorRotationTimer = window.setTimeout(() => void runSectorRotationRefresh(true), 30000);
+    }
+
+    async function runSectorRotationRefresh(silent = true) {
+      if (state.sectorRotationRefreshing) return null;
+      state.sectorRotationRefreshing = true;
+      try {
+        return await refreshSectorRotation(silent);
+      } finally {
+        state.sectorRotationRefreshing = false;
+        scheduleSectorRotationRefresh();
+      }
+    }
+
+    function startSectorRotationAutoRefresh() {
+      if (state.sectorRotationTimer) window.clearTimeout(state.sectorRotationTimer);
+      if (!state.sectorAutoRefresh || !canAutoRefreshData()) return;
+      void runSectorRotationRefresh(true);
     }
 
     async function fetchStockFundFlow(symbol, market) {
@@ -5141,7 +5190,7 @@
       $("fundSuperNet").textContent = darkTop.name ? `${darkTop.name} / ${darkTop.tailProxy || "-"}` : "-";
       $("fundFiveDay").textContent = `上榜 ${count} 只`;
       $("fundDarkProxy").textContent = darkWeak.name ? `${darkWeak.name} / ${darkWeak.tailProxy || "-"}` : "-";
-      const scopeText = flow.scope === "all" ? "全市场" : "主板";
+      const scopeText = flow.scopeLabel || fundBoardMarketLabel(flow.scope);
       const reasons = [
         `主力流入榜按${scopeText}股票池 + 当日涨跌/成交额排序，前几只先看。`,
         `暗盘这里是尾盘代理，不是真正券商暗盘，只用来观察收盘前抢筹/抛压。`,
@@ -5173,8 +5222,8 @@
             <tbody>${body || '<tr><td colspan="9" style="text-align:left;color:var(--muted)">暂无数据</td></tr>'}</tbody>
           </table>`;
       };
-      $("fundFlowBoard").innerHTML = renderTable(`主力资金流入靠前（${scopeText}）`, strong.slice(0, 12));
-      $("fundFlowWeakBoard").innerHTML = renderTable(`尾盘抛压靠前（${scopeText}）`, weak.slice(0, 12));
+      $("fundFlowBoard").innerHTML = renderTable(`主力资金流入前50（${scopeText}）`, strong.slice(0, 50));
+      $("fundFlowWeakBoard").innerHTML = renderTable(`尾盘抛压前50（${scopeText}）`, weak.slice(0, 50));
     }
 
     function setRadarCardVisible(visible) {
@@ -6451,6 +6500,16 @@
       if (state.fundBoardEnabled) startFundBoardAutoRefresh(false);
       $("statusText").textContent = `主力资金流向频率已设为 ${state.fundBoardInterval} 秒`;
     });
+    $("fundBoardMarketSelect").addEventListener("change", async (event) => {
+      state.fundBoardMarket = ["cn", "nonmain", "all"].includes(event.target.value) ? event.target.value : "cn";
+      saveSaved("quant_fundboard_market", state.fundBoardMarket);
+      state.fundBoardUpdatedAt = 0;
+      state.fundBoardNextRefreshAt = 0;
+      renderFundBoardConfig();
+      $("statusText").textContent = `正在刷新${fundBoardMarketLabel()}主力资金`;
+      await runFundBoardRefresh(false);
+      $("statusText").textContent = `已显示${fundBoardMarketLabel()}主力资金`;
+    });
     document.querySelectorAll(".module-tab").forEach((button) => {
       button.addEventListener("click", async () => {
         const view = button.dataset.view || "viewRadar";
@@ -6482,7 +6541,7 @@
     $("refreshSectorBtn").addEventListener("click", async () => {
       $("refreshSectorBtn").disabled = true;
       $("refreshSectorBtn").textContent = "刷新中";
-      await refreshSectorRotation(false);
+      await runSectorRotationRefresh(false);
       $("refreshSectorBtn").disabled = false;
       $("refreshSectorBtn").textContent = "刷新";
     });
@@ -6541,7 +6600,7 @@
       saveSaved("quant_fundboard_interval", state.fundBoardInterval);
       saveSaved("quant_fundboard_enabled", true);
       renderFundBoardConfig();
-      $("statusText").textContent = "正在抓取主力资金流向";
+      $("statusText").textContent = "正在抓取主力资金流向前50";
       scrollToResult("fundFlowSection");
       $("fundFlowBtn").disabled = true;
       $("fundFlowBtn").textContent = "抓取中";
@@ -6699,6 +6758,7 @@
     renderFundFlow(null);
     renderSectorRotation(null);
     if (state.fundBoardEnabled) startFundBoardAutoRefresh(false);
+    startSectorRotationAutoRefresh();
     void refreshPortfolioStageAlert(true);
     (async () => {
       if (await probeLocalApi()) {

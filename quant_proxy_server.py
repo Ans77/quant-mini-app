@@ -442,6 +442,8 @@ def parse_universe_items(items, target, market="cn"):
             continue
         if market == "cn" and not is_cn_main_board(code):
             continue
+        if market == "nonmain" and is_cn_main_board(code):
+            continue
         if market == "all" and not is_cn_all_board(code):
             continue
         if "ST" in name.upper() or "退" in name:
@@ -523,14 +525,20 @@ def a_share_universe(limit=10000, market="cn", use_cache=True):
         ("深市主板", "m:0+t:6,m:0+t:80"),
         ("沪市主板", "m:1+t:2,m:1+t:23"),
     ]
-    if market == "all":
+    if market in ("all", "nonmain"):
         boards = [
-            ("深市主板", "m:0+t:6,m:0+t:80"),
-            ("沪市主板", "m:1+t:2,m:1+t:23"),
             ("创业板", "m:0+t:80"),
             ("科创板", "m:1+t:23"),
             ("北交所", "m:0+t:81"),
         ]
+        if market == "all":
+            boards = [
+                ("深市主板", "m:0+t:6,m:0+t:80"),
+                ("沪市主板", "m:1+t:2,m:1+t:23"),
+                ("创业板", "m:0+t:80"),
+                ("科创板", "m:1+t:23"),
+                ("北交所", "m:0+t:81"),
+            ]
     for board_name, fs in boards:
         total_pages = None
         for page in range(1, 101):
@@ -567,7 +575,11 @@ def a_share_universe(limit=10000, market="cn", use_cache=True):
     if market == "cn" and len(disk_rows) >= 1000:
         return disk_rows[:limit]
     message = "；".join(errors[:4]) or "远端没有返回股票列表"
-    scope_text = "A股全市场" if market == "all" else "A股主板"
+    scope_text = {
+        "all": "A股全市场",
+        "nonmain": "A股非主板",
+        "cn": "A股主板",
+    }.get(market, "A股主板")
     raise RuntimeError(f"{scope_text}股票池读取失败：{message}")
 
 
@@ -940,11 +952,11 @@ def stage_from_daily(rows):
     closes = [parse_float(row.get("close")) for row in rows]
     closes = [value for value in closes if isinstance(value, (int, float)) and value > 0]
     if len(closes) < 160:
-        return {"stageNo": 0, "label": "阶段数据不足"}
+        return {"stageNo": 0, "label": "阶段数据不足（上市时间较短）"}
     weekly = closes[-260:]
     weekly = [weekly[index] for index in range(4, len(weekly), 5)]
     if len(weekly) < 30:
-        return {"stageNo": 0, "label": "阶段数据不足"}
+        return {"stageNo": 0, "label": "阶段数据不足（上市时间较短）"}
     last = weekly[-1]
     wma30 = sum(weekly[-30:]) / 30
     previous_wma30 = sum(weekly[-34:-4]) / 30 if len(weekly) >= 34 else wma30
@@ -975,7 +987,11 @@ def enrich_stage(item):
     try:
         stage = stage_from_daily(eastmoney_daily(symbol))
     except Exception:
-        stage = {"stageNo": 0, "label": "阶段未识别"}
+        try:
+            # 东方财富历史接口偶尔限流，使用腾讯日K作为备用来源。
+            stage = stage_from_daily(tencent_daily(symbol, "cn"))
+        except Exception:
+            stage = {"stageNo": 0, "label": "阶段未识别（历史行情暂时不可用）"}
     STAGE_CACHE[symbol] = {"time": time.time(), "stage": stage}
     return stage
 
@@ -1052,8 +1068,17 @@ def market_fund_flow_board(limit=20, market="cn"):
                 stage_items[symbol]["stage"] = {"stageNo": 0, "label": "阶段未识别"}
     return {
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "scope": "all" if market == "all" else "cn",
-        "source": ("全市场股票池" if market == "all" else "主板股票池") + " + 腾讯财经报价",
+        "scope": market if market in ("cn", "nonmain", "all") else "cn",
+        "scopeLabel": {
+            "cn": "主板",
+            "nonmain": "非主板",
+            "all": "全部",
+        }.get(market, "主板"),
+        "source": ({
+            "cn": "主板股票池",
+            "nonmain": "非主板股票池",
+            "all": "全市场股票池",
+        }.get(market, "主板股票池")) + " + 腾讯财经报价",
         "count": len(rows),
         "strong": strong,
         "weak": weak,
@@ -1131,7 +1156,7 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/fundboard":
                 limit = int((params.get("limit") or ["20"])[0] or 20)
                 market = (params.get("market") or ["cn"])[0]
-                if market not in ("cn", "all"):
+                if market not in ("cn", "nonmain", "all"):
                     market = "cn"
                 self.send_json({"data": market_fund_flow_board(limit, market)})
             elif parsed.path == "/api/sector-rotation":
