@@ -11,7 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -165,7 +165,7 @@ def eastmoney_suggest(text):
     return get_json(url)
 
 
-def eastmoney_daily(symbol):
+def eastmoney_daily(symbol, timeout=15, retries=3):
     code = normalize_symbol(symbol, "cn")
     if not (len(code) == 6 and code.isdigit()):
         raise RuntimeError(f"未识别A股代码：{symbol}")
@@ -181,7 +181,11 @@ def eastmoney_daily(symbol):
             "end": compact_date(0),
         }
     )
-    payload = get_json(f"https://push2his.eastmoney.com/api/qt/stock/kline/get?{query}")
+    payload = get_json(
+        f"https://push2his.eastmoney.com/api/qt/stock/kline/get?{query}",
+        timeout=timeout,
+        retries=retries,
+    )
     rows = []
     for line in payload.get("data", {}).get("klines", []) or []:
         cells = str(line).split(",")
@@ -746,7 +750,7 @@ def news_search(query, limit=6, name="", symbol="", market="cn"):
     return collected[:limit]
 
 
-def tencent_daily(symbol, market):
+def tencent_daily(symbol, market, timeout=15, retries=3):
     code = tencent_code(symbol, market)
     candidates = [
         f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={urllib.parse.quote(code)},day,,,800,qfq",
@@ -755,7 +759,7 @@ def tencent_daily(symbol, market):
     last_error = None
     for url in candidates:
         try:
-            payload = get_json(url)
+            payload = get_json(url, timeout=timeout, retries=retries)
             data = payload.get("data", {})
             block = data.get(code) or data.get(normalize_symbol(symbol, market)) or next(iter(data.values()), {})
             klines = block.get("qfqday") or block.get("day") or []
@@ -985,11 +989,11 @@ def enrich_stage(item):
     if cached and time.time() - cached.get("time", 0) < 300:
         return cached.get("stage") or {"stageNo": 0, "label": "阶段未识别"}
     try:
-        stage = stage_from_daily(eastmoney_daily(symbol))
+        stage = stage_from_daily(eastmoney_daily(symbol, timeout=5, retries=1))
     except Exception:
         try:
             # 东方财富历史接口偶尔限流，使用腾讯日K作为备用来源。
-            stage = stage_from_daily(tencent_daily(symbol, "cn"))
+            stage = stage_from_daily(tencent_daily(symbol, "cn", timeout=5, retries=1))
         except Exception:
             stage = {"stageNo": 0, "label": "阶段未识别（历史行情暂时不可用）"}
     STAGE_CACHE[symbol] = {"time": time.time(), "stage": stage}
@@ -997,7 +1001,7 @@ def enrich_stage(item):
 
 
 def market_fund_flow_board(limit=20, market="cn"):
-    universe = a_share_universe(limit=10000, market=market, use_cache=False)
+    universe = a_share_universe(limit=10000, market=market, use_cache=(market == "cn"))
     rows = []
     errors = []
     for item in universe:
@@ -1058,14 +1062,22 @@ def market_fund_flow_board(limit=20, market="cn"):
     strong = rows[:limit]
     weak = sorted(rows, key=lambda item: (item.get("score") or 0, item.get("amount") or 0, item.get("changePct") or 0))[:limit]
     stage_items = {item.get("symbol"): item for item in strong + weak if item.get("symbol")}
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(enrich_stage, item): symbol for symbol, item in stage_items.items()}
-        for future in as_completed(futures):
+    executor = ThreadPoolExecutor(max_workers=16)
+    futures = {executor.submit(enrich_stage, item): symbol for symbol, item in stage_items.items()}
+    try:
+        done, pending = wait(futures, timeout=12)
+        for future in done:
             symbol = futures[future]
             try:
                 stage_items[symbol]["stage"] = future.result()
             except Exception:
-                stage_items[symbol]["stage"] = {"stageNo": 0, "label": "阶段未识别"}
+                stage_items[symbol]["stage"] = {"stageNo": 0, "label": "阶段未识别（历史行情暂时不可用）"}
+        for future in pending:
+            symbol = futures[future]
+            future.cancel()
+            stage_items[symbol]["stage"] = {"stageNo": 0, "label": "阶段识别超时（稍后刷新）"}
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
     return {
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "scope": market if market in ("cn", "nonmain", "all") else "cn",
