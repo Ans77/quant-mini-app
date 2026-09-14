@@ -1813,6 +1813,12 @@
           <div id="recommendSummary" class="subtle">点击“推荐候选”开始扫描</div>
         </div>
         <div class="tool-row" style="margin:14px">
+          <label for="recommendScanMarketSelect">扫描范围</label>
+          <select id="recommendScanMarketSelect" aria-label="推荐股票扫描范围">
+            <option value="cn">主板</option>
+            <option value="nonmain">非主板</option>
+            <option value="all">全部</option>
+          </select>
           <button id="dailyRecommendBtn" class="secondary" type="button">今日推荐</button>
           <button id="realtimeBuyFinderBtn" class="secondary" type="button">找买点</button>
           <button id="smartFinderBtn" class="secondary" type="button">智能选股</button>
@@ -1985,6 +1991,8 @@
     };
 
     const $ = (id) => document.getElementById(id);
+    const marketDataCache = new Map();
+    const quoteCache = new Map();
     const fmtMoney = new Intl.NumberFormat("zh-CN", { style: "currency", currency: "CNY", maximumFractionDigits: 0 });
     const fmtNum = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 });
     let pendingRun = 0;
@@ -2991,6 +2999,113 @@
         volumeRatio,
         reasons,
         text: `股性${stockCharacterScore}/25 · 辨识${identityScore}/20 · 量价${structureScore}/25 · 当天${signalScore}/30`
+      };
+    }
+
+    function analyzeBottomTripleVolume(data, period = 5) {
+      const rows = (data || []).map((row) => ({
+        ...row,
+        open: Number.isFinite(row.open) ? row.open : row.close,
+        high: Number.isFinite(row.high) ? row.high : row.close,
+        low: Number.isFinite(row.low) ? row.low : row.close,
+        close: Number(row.close),
+        volume: Number(row.volume)
+      })).filter((row) => Number.isFinite(row.close) && row.close > 0);
+      const n = Math.max(3, Number(period) || 5);
+      const closes = rows.map((row) => row.close);
+      const ma60 = sma(closes, 60);
+      const candidates = [];
+      for (let i = n; i < rows.length; i += 1) {
+        const row = rows[i];
+        const previousVolumes = rows.slice(i - n, i)
+          .map((item) => item.volume)
+          .filter((value) => Number.isFinite(value) && value > 0);
+        const averageVolume = previousVolumes.length === n ? mean(previousVolumes) : null;
+        const previousClose = rows[i - 1]?.close;
+        const changePct = previousClose ? row.close / previousClose - 1 : 0;
+        const tripleVolume = Boolean(averageVolume && row.volume >= averageVolume * 3);
+        const bullishRise = row.close > row.open && changePct > 0.03;
+        const lowPosition = Boolean(ma60[i] && row.close < ma60[i] * 1.5);
+        if (tripleVolume && bullishRise && lowPosition) {
+          candidates.push({
+            index: i,
+            date: row.date,
+            triggerHigh: row.high,
+            triggerLow: row.low,
+            triggerClose: row.close,
+            volumeRatio: row.volume / averageVolume,
+            changePct,
+          });
+        }
+      }
+      const trigger = candidates.at(-1);
+      if (!trigger) {
+        return {
+          buyReady: false,
+          label: "底部三倍量未触发",
+          period: n,
+          reasons: ["近段时间没有同时满足：前5日均量3倍、收阳涨幅超过3%、低于60日均线1.5倍。"],
+          score: 0
+        };
+      }
+      const last = rows.at(-1);
+      const daysSince = rows.length - 1 - trigger.index;
+      const currentClose = last?.close || 0;
+      const currentLow = last?.low || currentClose;
+      const triggerToday = daysSince === 0;
+      const leftPullback = daysSince > 0
+        && currentClose >= trigger.triggerClose * 0.98
+        && currentClose <= trigger.triggerHigh * 1.03
+        && currentLow >= trigger.triggerLow * 0.98;
+      const rightBreakout = daysSince > 0
+        && currentClose >= trigger.triggerHigh * 1.01;
+      const buyReady = triggerToday || leftPullback || rightBreakout;
+      const signal = triggerToday
+        ? "三倍量当天观察"
+        : rightBreakout
+          ? "突破三倍量日高点"
+          : leftPullback
+            ? "三倍量后回调承接"
+            : "三倍量已触发，等待确认";
+      const reasons = [
+        `放量日 ${trigger.date}：成交量约为前${n}日均量 ${trigger.volumeRatio.toFixed(1)} 倍`,
+        `放量日收阳，涨幅约 ${(trigger.changePct * 100).toFixed(2)}%`,
+        "放量日收盘处于60日均线1.5倍以内，属于相对低位",
+        triggerToday
+          ? "今天就是放量日，先观察收盘和次日承接"
+          : rightBreakout
+            ? "当前价已突破放量日最高价，属于右侧确认"
+            : leftPullback
+              ? "放量后回调没有有效跌破放量日低点，属于左侧承接确认"
+              : "等待回调不破放量日收盘，或后续突破放量日最高价"
+      ];
+      const entryLow = triggerToday
+        ? trigger.triggerClose * 0.99
+        : rightBreakout
+          ? trigger.triggerHigh * 0.99
+          : trigger.triggerClose * 0.98;
+      const entryHigh = triggerToday
+        ? trigger.triggerHigh
+        : rightBreakout
+          ? trigger.triggerHigh * 1.03
+          : trigger.triggerClose * 1.02;
+      return {
+        buyReady,
+        label: signal,
+        period: n,
+        triggerDate: trigger.date,
+        triggerHigh: trigger.triggerHigh,
+        triggerLow: trigger.triggerLow,
+        triggerClose: trigger.triggerClose,
+        volumeRatio: trigger.volumeRatio,
+        triggerChangePct: trigger.changePct,
+        daysSince,
+        signal,
+        entryLow,
+        entryHigh,
+        stop: trigger.triggerLow,
+        score: clampScore(68 + (triggerToday ? 8 : leftPullback || rightBreakout ? 14 : 0)),
+        reasons
       };
     }
 
@@ -4134,10 +4249,15 @@
     }
 
     async function fetchMarketData(symbol, market, name = "") {
+      const cacheKey = `${market}:${symbol}`;
+      const cached = marketDataCache.get(cacheKey);
+      if (cached && Date.now() - cached.time < 10 * 60 * 1000) return cached.rows;
       if (state.dataSource === "ths") return fetchThsProxyDaily(symbol, market, name);
       if (await probeLocalApi()) {
         const url = apiUrl(`/api/daily?symbol=${encodeURIComponent(symbol)}&market=${encodeURIComponent(market)}&name=${encodeURIComponent(name)}`);
-        return parseGenericDailyRows(await fetchJson(url, "本地行情代理"), "本地行情代理");
+        const rows = parseGenericDailyRows(await fetchJson(url, "本地行情代理"), "本地行情代理");
+        marketDataCache.set(cacheKey, { time: Date.now(), rows });
+        return rows;
       }
       if (market === "cn") return fetchCnDaily(symbol);
       if (market === "crypto") return fetchCryptoDaily(symbol);
@@ -4188,7 +4308,9 @@
     function isAllowedRecommendationItem(item, scope = selectedRecommendationMarket()) {
       if (!item?.symbol) return false;
       if (item.market !== "cn") return false;
-      return scope === "all" ? isCnAllBoardSymbol(item.symbol) : isCnMainBoardSymbol(item.symbol);
+      if (scope === "all") return isCnAllBoardSymbol(item.symbol);
+      if (scope === "nonmain") return isCnAllBoardSymbol(item.symbol) && !isCnMainBoardSymbol(item.symbol);
+      return isCnMainBoardSymbol(item.symbol);
     }
 
     function normalizeEventText(text) {
@@ -4285,7 +4407,11 @@
     }
 
     function recommendationScopeLabel(scope = selectedRecommendationMarket()) {
-      return scope === "all" ? "全市场" : "主板";
+      return {
+        cn: "主板",
+        nonmain: "非主板",
+        all: "全市场"
+      }[scope] || "主板";
     }
 
     function formatLargeAmount(value) {
@@ -4305,9 +4431,7 @@
     function defaultRecommendationUniverse(scope = selectedRecommendationMarket()) {
       const localItems = SYMBOL_ALIASES.filter((item) => ["cn", "hk", "us"].includes(item.market));
       const items = uniqueInstruments([...CN_DISCOVERY_FALLBACK, ...localItems]);
-      const filtered = scope === "all"
-        ? items.filter((item) => isAllowedRecommendationItem(item, scope))
-        : items.filter((item) => item.market === scope && isAllowedRecommendationItem(item, scope));
+      const filtered = items.filter((item) => item.market === "cn" && isAllowedRecommendationItem(item, scope));
       return filtered;
     }
 
@@ -4696,8 +4820,13 @@
 
     async function fetchQuoteFor(symbol, market, name = "") {
       if (!await probeLocalApi()) return null;
+      const cacheKey = `${market}:${symbol}`;
+      const cached = quoteCache.get(cacheKey);
+      if (cached && Date.now() - cached.time < 20 * 1000) return cached.quote;
       const url = apiUrl(`/api/quote?symbol=${encodeURIComponent(symbol)}&market=${encodeURIComponent(market)}&name=${encodeURIComponent(name)}`);
-      return (await fetchJson(url, "腾讯财经报价")).data;
+      const quote = (await fetchJson(url, "腾讯财经报价")).data;
+      quoteCache.set(cacheKey, { time: Date.now(), quote });
+      return quote;
     }
 
     function escapeHtml(value) {
@@ -4934,6 +5063,7 @@
 
     function isBuyNowRecommendation(item) {
       if (item?.riskWatch) return true;
+      if (item?.bottomTripleVolume?.buyReady) return true;
       const plan = item?.buyPlan;
       const price = item?.quote?.price || item?.lastClose || plan?.referencePrice || 0;
       if (!plan?.entryLow || !plan?.entryHigh || !price) return false;
@@ -5204,6 +5334,7 @@
             <td>${idx + 1}</td>
             <td>${escapeHtml(item.name || item.symbol || "-")}</td>
             <td>${escapeHtml(item.symbol || "-")}</td>
+            <td>${escapeHtml(item.sector?.label || item.industry || "板块暂未获取")}</td>
             <td>${Number.isFinite(item.changePct) ? `${item.changePct >= 0 ? "+" : ""}${Number(item.changePct).toFixed(2)}%` : "-"}</td>
             <td>${formatLargeAmount(item.amount)}</td>
             <td>${escapeHtml(item.investorType || "-")}${Number.isFinite(item.investorConfidence) ? ` (${item.investorConfidence}%)` : ""}</td>
@@ -5217,9 +5348,9 @@
           </div>
           <table class="recommend-table">
             <thead>
-              <tr><th>#</th><th>股票</th><th>代码</th><th>涨跌</th><th>资金量</th><th>资金类型</th><th>阶段</th><th>暗盘</th><th>说明</th></tr>
+              <tr><th>#</th><th>股票</th><th>代码</th><th>所属板块</th><th>涨跌</th><th>资金量</th><th>资金类型</th><th>阶段</th><th>暗盘</th><th>说明</th></tr>
             </thead>
-            <tbody>${body || '<tr><td colspan="9" style="text-align:left;color:var(--muted)">暂无数据</td></tr>'}</tbody>
+            <tbody>${body || '<tr><td colspan="10" style="text-align:left;color:var(--muted)">暂无数据</td></tr>'}</tbody>
           </table>`;
       };
       $("fundFlowBoard").innerHTML = renderTable(`主力资金流入前50（${scopeText}）`, strong.slice(0, 50));
@@ -5358,6 +5489,7 @@
       const limitUpOnly = Boolean(options.limitUpOnly);
       const mainFlowOnly = Boolean(options.mainFlowOnly);
       const tactic233Only = Boolean(options.tactic233Only);
+      const tripleVolumeOnly = Boolean(options.tripleVolumeOnly);
       const smartOnly = Boolean(options.smartOnly);
       showRecommendations(smartOnly
         ? "智能选股已启动：同时检查主力入场、涨停二波和233战法。"
@@ -5365,6 +5497,8 @@
         ? "主力入场扫描已启动：先找第二阶段，再查主力资金流入。"
         : tactic233Only
           ? "233战法扫描已启动：先看板块方向，再找有股性和当天确认的股票。"
+        : tripleVolumeOnly
+          ? "底部三倍量扫描已启动：寻找低位放量并等待回调承接或突破确认。"
         : limitUpOnly
           ? "涨停二波扫描已启动：正在找涨停后缩量回调。"
           : "");
@@ -5392,11 +5526,13 @@
       $("recommendBtn").textContent = "扫描中";
       if ($("smartFinderBtn")) $("smartFinderBtn").textContent = smartOnly ? "扫描中" : "智能选股";
       $("recommendSummary").textContent = smartOnly
-        ? (scope === "all" ? "正在读取全市场，智能检查主力入场 / 涨停二波 / 233战法" : "正在读取沪深主板，智能检查主力入场 / 涨停二波 / 233战法")
+        ? (scope === "all" ? "正在读取全市场，智能检查主力入场 / 涨停二波 / 233战法 / 底部三倍量" : "正在读取沪深主板，智能检查主力入场 / 涨停二波 / 233战法 / 底部三倍量")
         : mainFlowOnly
         ? (scope === "all" ? "正在读取全市场，专找第二阶段 + 主力资金入场" : "正在读取沪深主板，专找第二阶段 + 主力资金入场")
         : tactic233Only
         ? (scope === "all" ? "正在读取全市场，按233战法找板块轮动半路机会" : "正在读取沪深主板，按233战法找板块轮动半路机会")
+        : tripleVolumeOnly
+        ? (scope === "all" ? "正在读取全市场，按底部三倍量策略筛选" : "正在读取沪深主板，按底部三倍量策略筛选")
         : limitUpOnly
         ? (scope === "all" ? "正在读取全市场，专找涨停后缩量回调二波" : "正在读取沪深主板，专找涨停后缩量回调二波")
         : (scope === "all" ? "正在读取全市场候选" : "正在读取沪深主板全量候选");
@@ -5408,11 +5544,13 @@
       renderNewsLeaderRadar(state.activeEventTheme);
       renderRecommendations();
         renderRecommendNotice(smartOnly
-        ? "智能选股已启动：一轮扫描同时检查三套规则，结果备注会写清楚命中条件。"
+        ? "智能选股已启动：一轮扫描同时检查主力入场、涨停二波、233战法和底部三倍量，结果备注会写清楚命中条件。"
         : mainFlowOnly
         ? "主力入场扫描已启动：先找第二阶段，再查主力资金流入，数量多时会慢一些。"
         : tactic233Only
           ? "233战法扫描已启动：先板块、后个股，不预测，只跟随当天已出现的资金进攻。"
+        : tripleVolumeOnly
+          ? "底部三倍量扫描已启动：备注会写清放量日、量能倍数、低位条件和买点确认。"
         : limitUpOnly
           ? "涨停二波扫描已启动：正在找涨停后缩量回调的股票。"
           : "候选扫描已启动：正在读取股票池。");
@@ -5440,6 +5578,8 @@
           ? `正在按主力入场模型扫描 ${universe.length} 只${scopeText}股票`
           : tactic233Only
           ? `正在按233战法扫描 ${universe.length} 只${scopeText}股票`
+          : tripleVolumeOnly
+          ? `正在按底部三倍量扫描 ${universe.length} 只${scopeText}股票`
           : limitUpOnly
           ? `正在按涨停二波模型扫描 ${universe.length} 只${scopeText}股票`
           : `正在读取大盘，再扫描 ${universe.length} 只${scopeText}股票`;
@@ -5478,14 +5618,15 @@
             const rows = await fetchMarketData(item.symbol, item.market, item.name || "");
             const holding = state.holdings.find((row) => storageKey(row) === storageKey(item));
             const analysis = analyzeSignal(rows, holding);
-            const weekly = analyzeWeeklyBollPullback(rows);
-            const wave = analysis.secondWave || analyzeLimitUpSecondWave(rows);
+          const weekly = analyzeWeeklyBollPullback(rows);
+          const wave = analysis.secondWave || analyzeLimitUpSecondWave(rows);
+          const tripleVolume = analyzeBottomTripleVolume(rows, 5);
             const alreadyHolding = Boolean(holding);
             const marketBias = marketBiasFor(item, state.marketContext);
             const eventMeta = eventMetaFor(item);
             const riskRepair = analysis.drawdown60 > -0.08 ? 4 : 0;
             const stageNo = analysis.weinstein?.stageNo;
-            const stage3Watch = Boolean(smartOnly && stageNo === 3 && (weekly.takeProfit || analysis.score >= 58 || analysis.drawdown60 > -0.12));
+            const stage3Watch = Boolean((smartOnly || tripleVolumeOnly) && stageNo === 3 && (weekly.takeProfit || analysis.score >= 58 || analysis.drawdown60 > -0.12));
             if (isBuyBlockedByStage(analysis, weekly) && !stage3Watch) continue;
             let flow = null;
             let flowFiveMain = 0;
@@ -5507,7 +5648,7 @@
               if (mainFlowOnly && !flowOk) continue;
             }
             let quote = item.quote || null;
-            if (tactic233Only || smartOnly) {
+            if (tactic233Only) {
               try {
                 quote = await fetchQuoteFor(item.symbol, item.market, item.name || "");
               } catch (error) {
@@ -5517,11 +5658,13 @@
             let stockNews = [];
             let newsTone = { score: 0, label: "新闻未取" };
             if (tactic233Only || smartOnly) {
-              try {
-                stockNews = await fetchStockNewsContext(item, 3);
-                newsTone = scoreNewsItems(stockNews);
-              } catch (error) {
-                newsTone = { score: 0, label: "新闻失败" };
+              if (tactic233Only) {
+                try {
+                  stockNews = await fetchStockNewsContext(item, 3);
+                  newsTone = scoreNewsItems(stockNews);
+                } catch (error) {
+                  newsTone = { score: 0, label: "新闻失败" };
+                }
               }
             }
             const tactic233 = (tactic233Only || smartOnly) ? analyzeTactic233(rows, analysis, weekly, wave, item, state.marketContext, eventMeta, newsTone, quote) : null;
@@ -5529,15 +5672,29 @@
             if (flowOk) matchedConditions.push("主力入场");
             if (wave.buyReady) matchedConditions.push("涨停二波");
             if (tactic233?.buyReady) matchedConditions.push("233战法");
+            if (tripleVolume.buyReady) matchedConditions.push("底部三倍量");
             if (stage3Watch) matchedConditions.push("第三阶段筑顶风险");
-            const passesModel = smartOnly ? matchedConditions.length > 0 : mainFlowOnly ? flowOk : (tactic233Only ? tactic233.buyReady : (limitUpOnly ? wave.buyReady : (weekly.buyReady || wave.buyReady)));
+            const passesModel = smartOnly
+              ? matchedConditions.length > 0
+              : mainFlowOnly
+                ? flowOk
+                : tripleVolumeOnly
+                  ? tripleVolume.buyReady
+                  : (tactic233Only ? tactic233.buyReady : (limitUpOnly ? wave.buyReady : (weekly.buyReady || wave.buyReady)));
             if (passesModel) {
-              if (!(tactic233Only || smartOnly)) {
+              if (!tactic233Only && !smartOnly) {
                 try {
                   quote = await fetchQuoteFor(item.symbol, item.market, item.name || "");
                 } catch (error) {
                   quote = item.quote || null;
                 }
+                try {
+                  stockNews = await fetchStockNewsContext(item, 3);
+                  newsTone = scoreNewsItems(stockNews);
+                } catch (error) {
+                  newsTone = { score: 0, label: "新闻失败" };
+                }
+              } else if (smartOnly) {
                 try {
                   stockNews = await fetchStockNewsContext(item, 3);
                   newsTone = scoreNewsItems(stockNews);
@@ -5550,33 +5707,44 @@
               const waveBoost = wave.buyReady ? Math.max(0, wave.score - 60) : 0;
               const flowBoost = flowOk ? Math.min(12, Math.max(2, Math.round((flowFiveMain || flowLatestMain || 0) / 100000000))) : 0;
               const decisionScore = scoreBuySellDecision({ weekly, secondWave: wave, analysis, item, newsTone, context: state.marketContext, eventMeta });
-              const baseScore = (tactic233Only || smartOnly) ? Math.max(tactic233?.score || 0, wave.score, flowOk ? decisionScore.total + 8 : 0) : limitUpOnly ? wave.score : Math.max(weekly.score, wave.score);
+              const baseScore = tripleVolumeOnly
+                ? tripleVolume.score
+                : (tactic233Only || smartOnly) ? Math.max(tactic233?.score || 0, wave.score, flowOk ? decisionScore.total + 8 : 0) : limitUpOnly ? wave.score : Math.max(weekly.score, wave.score);
               const trendBase = mainFlowOnly ? Math.max(68, decisionScore.total + 8) : baseScore;
               const tacticBoost = tactic233?.buyReady ? Math.max(4, Math.round((tactic233.score - 65) * 0.45)) : 0;
               const finalScore = clampScore(Math.round((trendBase * 0.55) + (decisionScore.total * 0.45)) + marketBias + Math.min(6, newsTone.score) - overheadPenalty - upperChasePenalty + Math.round(waveBoost * 0.35) + flowBoost + tacticBoost);
               const eventBoost = eventMeta ? Number(eventMeta.eventBoost) || 0 : 0;
               const rank = finalScore + 28 + eventBoost + (alreadyHolding ? -8 : 0) + riskRepair - Math.round((weekly.overheadRatio || 0) * 20) + (wave.buyReady ? 8 : 0) + flowBoost + (tactic233?.buyReady ? 8 : 0) - (stage3Watch ? 35 : 0);
               const marketText = item.market === "cn" && state.marketContext ? `大盘${state.marketContext.mood}` : marketName(item.market);
-              const buyPlan = calcBuyPlan(rows, analysis, quote, finalScore, wave);
               const currentPrice = quote?.price || rows.at(-1).close;
               const currentChange = quote?.changePct == null ? null : Number(quote.changePct) / 100;
+              const buyPlan = (tripleVolumeOnly || smartOnly && tripleVolume.buyReady && !wave.buyReady && !weekly.buyReady)
+                ? {
+                    entryLow: tripleVolume.entryLow,
+                    entryHigh: tripleVolume.entryHigh,
+                    referencePrice: currentPrice,
+                    text: `${tripleVolume.signal} ${fmtNum.format(tripleVolume.entryLow)}-${fmtNum.format(tripleVolume.entryHigh)}`,
+                    note: "止损参考放量日最低价"
+                }
+                : calcBuyPlan(rows, analysis, quote, finalScore, wave);
               const tactic233Follow = Boolean(tactic233?.buyReady && currentChange != null && currentChange >= 0.015 && currentChange <= 0.088);
               const planInRange = Boolean(buyPlan?.entryLow && buyPlan?.entryHigh && currentPrice >= buyPlan.entryLow && currentPrice <= buyPlan.entryHigh);
-              const buyNow = stage3Watch || tactic233Follow || planInRange;
+              const buyNow = stage3Watch || tripleVolumeOnly && tripleVolume.buyReady || smartOnly && tripleVolume.buyReady || tactic233Follow || planInRange;
               if (!buyNow) continue;
-              buyPlan.liveState = stage3Watch ? "风险观察" : tactic233Follow ? "233跟随区" : "当日买入区";
-              decisionScore.label = stage3Watch ? "筑顶风险" : smartOnly ? "智能命中" : mainFlowOnly ? "主力入场" : tactic233Only ? "233战法" : "当日买点";
-              decisionScore.action = stage3Watch ? "第三阶段筑顶风险，只观察不新买" : smartOnly ? `命中：${matchedConditions.join(" + ")}` : mainFlowOnly ? "第二阶段主力资金进入买入区" : tactic233Only ? "板块确认后跟随强股" : wave.buyReady ? "涨停二波进入买入区" : "周K回踩进入买入区";
+              buyPlan.liveState = stage3Watch ? "风险观察" : tripleVolumeOnly || smartOnly && tripleVolume.buyReady && !wave.buyReady && !weekly.buyReady ? tripleVolume.signal : tactic233Follow ? "233跟随区" : "当日买入区";
+              decisionScore.label = stage3Watch ? "筑顶风险" : smartOnly ? "智能命中" : mainFlowOnly ? "主力入场" : tripleVolumeOnly ? "底部三倍量" : tactic233Only ? "233战法" : "当日买点";
+              decisionScore.action = stage3Watch ? "第三阶段筑顶风险，只观察不新买" : smartOnly ? `命中：${matchedConditions.join(" + ")}` : mainFlowOnly ? "第二阶段主力资金进入买入区" : tripleVolumeOnly ? tripleVolume.signal : tactic233Only ? "板块确认后跟随强股" : wave.buyReady ? "涨停二波进入买入区" : "周K回踩进入买入区";
               const mainFlowReason = mainFlowOnly
                 ? [`第二阶段上升趋势`, `5日主力 ${formatSignedAmount(flowFiveMain)}`, `当日主力 ${formatSignedAmount(flowLatestMain)}`].join("；")
                 : "";
               const conditionText = matchedConditions.length ? `命中条件：${matchedConditions.join(" + ")}` : "";
               const mainFlowText = flowOk ? [`第二阶段上升趋势`, `5日主力 ${formatSignedAmount(flowFiveMain)}`, `当日主力 ${formatSignedAmount(flowLatestMain)}`].join("；") : "";
               const tacticReason = tactic233?.buyReady ? tactic233.reasons.join("；") : "";
+              const tripleVolumeReason = tripleVolume.buyReady ? tripleVolume.reasons.join("；") : "";
               const stage3Reason = stage3Watch ? "第三阶段筑顶风险：上涨后进入高位震荡/派发观察区，不建议新开仓，可用于持仓止盈或观察主线退潮" : "";
               const modelReason = smartOnly
-                ? [conditionText, stage3Reason, mainFlowText, wave.buyReady ? wave.reasons.join("；") : "", tacticReason].filter(Boolean).join("；")
-                : tactic233Only ? tactic233.reasons.join("；") : "";
+                ? [conditionText, stage3Reason, mainFlowText, wave.buyReady ? wave.reasons.join("；") : "", tacticReason, tripleVolume.buyReady ? tripleVolumeReason : ""].filter(Boolean).join("；")
+                : tripleVolumeOnly ? tripleVolumeReason : tactic233Only ? tactic233.reasons.join("；") : "";
               upsertRecommendation({
                 ...item,
                 score: finalScore,
@@ -5588,20 +5756,21 @@
                 eventLayer: eventMeta?.eventLayer || "",
                 eventReason: eventMeta?.eventReason || "",
                 eventTier: eventMeta?.eventTier || "",
-                stageNo: stage3Watch ? 3 : 2,
-                stageLabel: stage3Watch ? "第三阶段筑顶风险" : smartOnly ? matchedConditions.join(" + ") : mainFlowOnly ? "主力入场 + 第二阶段" : tactic233Only ? tactic233.label : wave.buyReady ? wave.label : weekly.alert,
+                stageNo: stage3Watch ? 3 : analysis.weinstein?.stageNo || 0,
+                stageLabel: stage3Watch ? "第三阶段筑顶风险" : smartOnly ? matchedConditions.join(" + ") : mainFlowOnly ? "主力入场 + 第二阶段" : tripleVolumeOnly ? tripleVolume.signal : tactic233Only ? tactic233.label : wave.buyReady ? wave.label : weekly.alert,
                 weinstein: analysis.weinstein,
                 weeklyBoll: weekly,
                 secondWave: wave,
                 tactic233,
+                bottomTripleVolume: tripleVolume,
                 matchedConditions,
                 riskWatch: stage3Watch,
                 rank,
-                action: stage3Watch ? "第三阶段风险观察" : smartOnly ? `智能选股：${matchedConditions.join(" + ")}` : mainFlowOnly ? "主力入场当日买点" : tactic233Only ? "233战法当日跟随" : wave.buyReady ? "涨停二波当日买点" : "周K回踩当日买点",
-                targetPosition: stage3Watch ? "不建议新买，持仓看止盈" : smartOnly ? "10-30%，按命中强弱分批" : mainFlowOnly ? "15-30%，分批" : tactic233Only ? "10-25%，半路分批" : wave.buyReady ? "20-35%，分批" : "20-40%，分批",
+                action: stage3Watch ? "第三阶段风险观察" : smartOnly ? `智能选股：${matchedConditions.join(" + ")}` : mainFlowOnly ? "主力入场当日买点" : tripleVolumeOnly ? `底部三倍量：${tripleVolume.signal}` : tactic233Only ? "233战法当日跟随" : wave.buyReady ? "涨停二波当日买点" : "周K回踩当日买点",
+                targetPosition: stage3Watch ? "不建议新买，持仓看止盈" : smartOnly ? "10-30%，按命中强弱分批" : mainFlowOnly ? "15-30%，分批" : tripleVolumeOnly ? "10-20%，分批，确认后再加" : tactic233Only ? "10-25%，半路分批" : wave.buyReady ? "20-35%，分批" : "20-40%，分批",
                 buyPlan,
-                stop: stage3Watch ? (analysis.stop || weekly.stop) : mainFlowOnly ? (analysis.stop || weekly.stop) : wave.buyReady ? wave.stop : weekly.stop,
-                reason: smartOnly ? modelReason : mainFlowOnly ? mainFlowReason : tactic233Only ? modelReason : wave.buyReady ? wave.reasons.join("；") : weekly.reasons.join("；"),
+                stop: stage3Watch ? (analysis.stop || weekly.stop) : mainFlowOnly ? (analysis.stop || weekly.stop) : tripleVolumeOnly ? tripleVolume.stop : wave.buyReady ? wave.stop : weekly.stop,
+                reason: smartOnly ? modelReason : mainFlowOnly ? mainFlowReason : tripleVolumeOnly ? tripleVolumeReason : tactic233Only ? modelReason : wave.buyReady ? wave.reasons.join("；") : weekly.reasons.join("；"),
                 marketText,
                 newsText: stockNews.length ? `${newsTone.label}：${newsHeadline(stockNews)}` : "未找到股票名/代码命中的相关新闻",
                 newsItems: stockNews,
@@ -5615,7 +5784,7 @@
             failed += 1;
           }
             scannedCount += 1;
-            if (scannedCount % 6 === 0 || scannedCount === universe.length) {
+            if (scannedCount % 12 === 0 || scannedCount === universe.length) {
               state.recommendations = dedupeRecommendations(state.recommendations);
               state.recommendations.sort((a, b) => b.rank - a.rank || b.stageNo - a.stageNo);
               renderRecommendations();
@@ -5623,7 +5792,7 @@
             }
           }
         };
-        const workerCount = Math.min(6, universe.length);
+        const workerCount = Math.min(10, universe.length);
         await Promise.all(Array.from({ length: workerCount }, () => worker()));
         state.recommendations = dedupeRecommendations(state.recommendations).filter((item) => item.rank >= 0).slice(0, 10);
         state.recommendations.sort((a, b) => b.rank - a.rank || b.stageNo - a.stageNo);
@@ -5637,13 +5806,15 @@
             : mainFlowOnly
             ? `完成：筛出 ${state.recommendations.length} 个主力入场当日买点，失败 ${failed} 只`
             : tactic233Only
-            ? `完成：筛出 ${state.recommendations.length} 个233战法当日跟随候选，失败 ${failed} 只`
-            : limitUpOnly
+          ? `完成：筛出 ${state.recommendations.length} 个233战法当日跟随候选，失败 ${failed} 只`
+          : tripleVolumeOnly
+          ? `完成：筛出 ${state.recommendations.length} 个底部三倍量候选，失败 ${failed} 只`
+          : limitUpOnly
             ? `完成：筛出 ${state.recommendations.length} 个涨停二波当日买点，失败 ${failed} 只`
             : `完成：筛出 ${state.recommendations.length} 个当日买点，失败 ${failed} 只`;
           $("statusText").textContent = state.recommendations.length
             ? (smartOnly ? "智能选股扫描完成" : mainFlowOnly ? "主力入场当日买点扫描完成" : tactic233Only ? "233战法扫描完成" : limitUpOnly ? "涨停二波当日买点扫描完成" : "当日买点扫描完成")
-            : (smartOnly ? "暂无符合智能选股条件的股票" : mainFlowOnly ? "暂无进入买入区的主力入场股" : tactic233Only ? "暂无符合233战法的当日跟随股" : limitUpOnly ? "暂无进入买入区的涨停二波股票" : "暂无进入买入区的股票");
+            : (smartOnly ? "暂无符合智能选股条件的股票" : mainFlowOnly ? "暂无进入买入区的主力入场股" : tripleVolumeOnly ? "暂无满足底部三倍量条件的股票" : tactic233Only ? "暂无符合233战法的当日跟随股" : limitUpOnly ? "暂无进入买入区的涨停二波股票" : "暂无进入买入区的股票");
         }
       } catch (error) {
         $("recommendSummary").textContent = `推荐扫描中断：${error.message}`;
@@ -5993,16 +6164,17 @@
         if (item.secondWave?.buyReady) acc.wave += 1;
         if (String(item.action || "").includes("主力入场")) acc.flow += 1;
         if (item.tactic233?.buyReady || String(item.action || "").includes("233战法")) acc.tactic233 += 1;
+        if (item.bottomTripleVolume?.buyReady || String(item.action || "").includes("底部三倍量")) acc.tripleVolume += 1;
         if (item.riskWatch || item.weinstein?.stageNo === 3) acc.stage3 += 1;
         if (item.weeklyBoll?.takeProfit || item.weeklyBoll?.stopLoss) acc.risky += 1;
         if (item.holding && (item.weeklyBoll?.takeProfit || item.weeklyBoll?.stopLoss)) acc.holdingRisk += 1;
         return acc;
-      }, { good: 0, wave: 0, flow: 0, tactic233: 0, stage3: 0, watch: 0, risky: 0, holdingRisk: 0 });
-      const topGood = rows.find((item) => item.weeklyBoll?.buyReady || item.secondWave?.buyReady) || rows[0];
+      }, { good: 0, wave: 0, flow: 0, tactic233: 0, tripleVolume: 0, stage3: 0, watch: 0, risky: 0, holdingRisk: 0 });
+      const topGood = rows.find((item) => item.weeklyBoll?.buyReady || item.secondWave?.buyReady || item.bottomTripleVolume?.buyReady) || rows[0];
       state.recommendationStage = {
         updatedAt: Date.now(),
-        text: (stageCounts.good || stageCounts.wave || stageCounts.flow || stageCounts.tactic233 || stageCounts.stage3)
-          ? `筛出 ${stageCounts.good + stageCounts.wave + stageCounts.flow + stageCounts.tactic233} 只当日买点，其中周K回踩 ${stageCounts.good} 只，涨停二波 ${stageCounts.wave} 只，主力入场 ${stageCounts.flow} 只，233战法 ${stageCounts.tactic233} 只；另有第三阶段风险观察 ${stageCounts.stage3} 只。`
+        text: (stageCounts.good || stageCounts.wave || stageCounts.flow || stageCounts.tactic233 || stageCounts.tripleVolume || stageCounts.stage3)
+          ? `筛出 ${stageCounts.good + stageCounts.wave + stageCounts.flow + stageCounts.tactic233 + stageCounts.tripleVolume} 只当日买点，其中周K回踩 ${stageCounts.good} 只，涨停二波 ${stageCounts.wave} 只，主力入场 ${stageCounts.flow} 只，233战法 ${stageCounts.tactic233} 只，底部三倍量 ${stageCounts.tripleVolume} 只；另有第三阶段风险观察 ${stageCounts.stage3} 只。`
           : "暂无进入当日买入区或第三阶段风险观察的股票。",
         ...stageCounts
       };
@@ -6017,10 +6189,13 @@
         const weekly = item.weeklyBoll;
         const wave = item.secondWave;
         const tactic233 = item.tactic233;
+        const tripleVolume = item.bottomTripleVolume;
         const currentStage = item.weinstein;
         const currentStageText = currentStage?.label || "-";
         const currentStageClass = currentStage?.className || stageTone(currentStage?.stageNo).cls;
-        const factorText = tactic233?.buyReady
+        const factorText = tripleVolume?.buyReady
+          ? `底部三倍量<br><span class="subtle">${escapeHtml(tripleVolume.signal || "")}；放量约 ${Number(tripleVolume.volumeRatio || 0).toFixed(1)} 倍<br>放量日 ${escapeHtml(tripleVolume.triggerDate || "-")}；止损 ${fmtNum.format(tripleVolume.stop || 0)}</span>`
+          : tactic233?.buyReady
           ? `233战法<br><span class="subtle">${escapeHtml(tactic233.text || "")}</span>`
           : wave?.buyReady
           ? `涨停二波 ${wave.limitDate || "-"}<br><span class="subtle">调整 ${wave.daysSince ?? "-"} 天 / 回撤 ${pct(wave.retrace || 0)} / MACD ${wave.macdOk ? "修复" : "未修复"}</span>`
@@ -6117,6 +6292,7 @@
       saveSaved("quant_recommend_market", state.recommendMarket);
       saveSaved("quant_recommend_source", "discover");
       $("recommendMarketSelect").value = state.recommendMarket;
+      if ($("recommendScanMarketSelect")) $("recommendScanMarketSelect").value = state.recommendMarket;
       $("recommendSourceSelect").value = "discover";
     }
 
@@ -6407,12 +6583,23 @@
     $("recommendMarketSelect").addEventListener("change", (event) => {
       state.recommendMarket = event.target.value;
       saveSaved("quant_recommend_market", state.recommendMarket);
+      if ($("recommendScanMarketSelect")) $("recommendScanMarketSelect").value = state.recommendMarket;
       state.recommendations = [];
       goView("viewRecommendations");
       renderRecommendations();
       const all = state.recommendMarket === "all";
       $("recommendSummary").textContent = all ? "推荐范围：全市场，包含创业板/科创板/北交所" : "推荐范围：只扫沪深主板，排除创业板/科创板/北交所";
       $("statusText").textContent = all ? "推荐范围：全市场" : "推荐范围：只扫沪深主板";
+    });
+    $("recommendScanMarketSelect").addEventListener("change", (event) => {
+      state.recommendMarket = ["cn", "nonmain", "all"].includes(event.target.value) ? event.target.value : "cn";
+      saveSaved("quant_recommend_market", state.recommendMarket);
+      $("recommendMarketSelect").value = state.recommendMarket;
+      const label = recommendationScopeLabel();
+      $("recommendSummary").textContent = state.recommendMarket === "all"
+        ? "扫描范围已设为：全部（含主板、创业板、科创板、北交所）"
+        : `扫描范围已设为：${label}`;
+      $("statusText").textContent = `推荐扫描范围：${label}`;
     });
     $("recommendSourceSelect").addEventListener("change", (event) => {
       state.recommendSource = "discover";
@@ -6559,13 +6746,12 @@
     });
     $("smartFinderBtn").addEventListener("click", () => {
       goView("viewRecommendations");
-      state.recommendMarket = "all";
       state.recommendSource = "discover";
       saveSaved("quant_recommend_market", state.recommendMarket);
       saveSaved("quant_recommend_source", state.recommendSource);
       renderRecommendMarketConfig();
       renderRealtimeConfig();
-      $("recommendSummary").textContent = "正在智能扫描：主力入场 / 涨停二波 / 233战法";
+      $("recommendSummary").textContent = "正在智能扫描：主力入场 / 涨停二波 / 233战法 / 底部三倍量";
       $("statusText").textContent = "正在智能选股";
       $("smartFinderBtn").textContent = "扫描中";
       scrollToResult("viewRecommendations");

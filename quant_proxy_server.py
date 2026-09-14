@@ -21,6 +21,7 @@ TOKEN = "D43BF722C8E33BFB4CCDD645719E5169"
 CACHE_FILE = os.path.join(ROOT, "quant_universe_cache.json")
 UNIVERSE_CACHE = {"time": 0, "rows": []}
 STAGE_CACHE = {}
+SECTOR_CACHE = {}
 EASTMONEY_CLIST_HOSTS = [
     "https://push2delay.eastmoney.com/api/qt/clist/get",
     "https://push2.eastmoney.com/webguest/api/qt/clist/get",
@@ -199,6 +200,32 @@ def eastmoney_daily(symbol, timeout=15, retries=3):
                 "volume": float(cells[5]),
             })
     return rows
+
+
+def eastmoney_stock_sector(symbol):
+    code = normalize_symbol(symbol, "cn")
+    secid = f"{cn_market_prefix(code)}.{code}"
+    query = urllib.parse.urlencode({
+        "secid": secid,
+        "fields": "f57,f58,f127,f128,f140",
+    })
+    payload = get_json(
+        f"https://push2.eastmoney.com/api/qt/stock/get?{query}",
+        timeout=5,
+        retries=1,
+    )
+    data = payload.get("data") or {}
+    industry = str(data.get("f127") or "").strip()
+    concept = str(data.get("f140") or data.get("f128") or "").strip()
+    if industry in ("-", "None", "null"):
+        industry = ""
+    if concept in ("-", "None", "null"):
+        concept = ""
+    return {
+        "industry": industry,
+        "concept": concept,
+        "label": " / ".join(part for part in (industry, concept) if part) or "板块暂未获取",
+    }
 
 
 def eastmoney_fund_flow_daily(symbol):
@@ -461,6 +488,8 @@ def parse_universe_items(items, target, market="cn"):
             "volume": item.get("f5"),
             "amount": item.get("f6"),
             "marketValue": item.get("f20"),
+            "industry": str(item.get("f127") or "").strip(),
+            "sector": str(item.get("f127") or "").strip(),
             "source": "东方财富A股股票池",
         }
 
@@ -477,7 +506,7 @@ def clist_payload(fs, page=1, page_size=5000):
             "invt": "2",
             "fid": "f6",
             "fs": fs,
-            "fields": "f12,f14,f2,f3,f5,f6,f20",
+            "fields": "f12,f14,f2,f3,f5,f6,f20,f127",
         }
     )
     last_error = None
@@ -1000,6 +1029,23 @@ def enrich_stage(item):
     return stage
 
 
+def enrich_sector(item):
+    symbol = item.get("symbol") or ""
+    cached = SECTOR_CACHE.get(symbol)
+    if cached and time.time() - cached.get("time", 0) < 1800:
+        return cached.get("sector") or {"label": "板块暂未获取"}
+    fallback = str(item.get("sector") or item.get("industry") or "").strip()
+    sector = {"label": fallback or "板块暂未获取"}
+    try:
+        remote = eastmoney_stock_sector(symbol)
+        if remote.get("label") != "板块暂未获取":
+            sector = remote
+    except Exception:
+        pass
+    SECTOR_CACHE[symbol] = {"time": time.time(), "sector": sector}
+    return sector
+
+
 def market_fund_flow_board(limit=20, market="cn"):
     universe = a_share_universe(limit=10000, market=market, use_cache=(market == "cn"))
     rows = []
@@ -1078,6 +1124,22 @@ def market_fund_flow_board(limit=20, market="cn"):
             stage_items[symbol]["stage"] = {"stageNo": 0, "label": "阶段识别超时（稍后刷新）"}
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
+    sector_executor = ThreadPoolExecutor(max_workers=16)
+    sector_futures = {sector_executor.submit(enrich_sector, item): symbol for symbol, item in stage_items.items()}
+    try:
+        done, pending = wait(sector_futures, timeout=8)
+        for future in done:
+            symbol = sector_futures[future]
+            try:
+                stage_items[symbol]["sector"] = future.result()
+            except Exception:
+                stage_items[symbol]["sector"] = {"label": "板块暂未获取"}
+        for future in pending:
+            symbol = sector_futures[future]
+            future.cancel()
+            stage_items[symbol]["sector"] = {"label": "板块获取超时"}
+    finally:
+        sector_executor.shutdown(wait=False, cancel_futures=True)
     return {
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "scope": market if market in ("cn", "nonmain", "all") else "cn",
@@ -1179,20 +1241,28 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/universe":
                 market = (params.get("market") or ["cn"])[0]
                 limit = int((params.get("limit") or ["5000"])[0] or 5000)
-                if market not in ("cn", "all"):
+                if market not in ("cn", "nonmain", "all"):
                     self.send_json({"data": [], "meta": {"count": 0, "source": "unsupported"}})
                 else:
                     try:
                         cache_time_before = UNIVERSE_CACHE.get("time") or 0
                         rows = a_share_universe(limit, market=market)
                         cached = bool(rows) and cache_time_before == (UNIVERSE_CACHE.get("time") or 0)
-                        source = "东方财富A股全市场股票池" if market == "all" else "东方财富主板股票池"
+                        source = {
+                            "cn": "东方财富A股主板股票池",
+                            "nonmain": "东方财富A股非主板股票池",
+                            "all": "东方财富A股全市场股票池",
+                        }.get(market, "东方财富A股主板股票池")
                         self.send_json({"data": rows, "meta": {"count": len(rows), "source": source, "cached": cached}})
                     except Exception as exc:
                         self.send_json({
                             "data": [],
                             "error": str(exc),
-                            "meta": {"count": 0, "source": "东方财富A股全市场股票池" if market == "all" else "东方财富主板股票池", "cached": False},
+                            "meta": {"count": 0, "source": {
+                                "cn": "东方财富A股主板股票池",
+                                "nonmain": "东方财富A股非主板股票池",
+                                "all": "东方财富A股全市场股票池",
+                            }.get(market, "东方财富A股主板股票池"), "cached": False},
                         })
             elif parsed.path == "/api/news":
                 query = (params.get("q") or [""])[0]
