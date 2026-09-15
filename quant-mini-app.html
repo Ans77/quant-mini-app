@@ -1789,15 +1789,18 @@
             <h2>持仓/买过</h2>
             <div id="holdingSummary" class="subtle">未记录</div>
           </div>
+          <div id="holdingActionSummary" class="risk-note">点击“今日提醒”生成加仓、维持、减仓建议。</div>
           <div class="table-wrap">
             <table>
               <thead>
                 <tr>
-                  <th>代码</th>
-                  <th>数量</th>
-                  <th>成本</th>
-                  <th>浮盈</th>
-                  <th>卖点</th>
+                  <th>选择</th>
+                  <th>股票</th>
+                  <th>趋势</th>
+                  <th>今日操作</th>
+                  <th>关键价位</th>
+                  <th>现价/盈亏</th>
+                  <th>持仓信息</th>
                   <th>操作</th>
                 </tr>
               </thead>
@@ -4642,7 +4645,98 @@
       return { cls: "signal-wait", label: "过渡阶段" };
     }
 
-    function buildHoldingExitAdvice(item, rows, stage, weekly, wave) {
+    function buildUnifiedDecision(rows, item, stage, weekly, wave, fundFlow = null) {
+      const normalized = (rows || []).map((row) => ({
+        ...row,
+        open: Number.isFinite(row.open) ? row.open : row.close,
+        high: Number.isFinite(row.high) ? row.high : row.close,
+        low: Number.isFinite(row.low) ? row.low : row.close,
+        close: Number(row.close),
+        volume: Number(row.volume)
+      })).filter((row) => Number.isFinite(row.close) && row.close > 0);
+      const closes = normalized.map((row) => row.close);
+      const last = normalized.at(-1);
+      const previous = normalized.at(-2);
+      const ma5 = lastValid(sma(closes, 5));
+      const ma10 = lastValid(sma(closes, 10));
+      const ma20 = lastValid(sma(closes, 20));
+      const ma60 = lastValid(sma(closes, 60));
+      const ma250 = lastValid(sma(closes, 250));
+      const dailyBands = bollinger(closes, 20, 2).at(-1);
+      const macdLine = macd(closes);
+      const dif = macdLine.dif.at(-1);
+      const dea = macdLine.dea.at(-1);
+      const prevDif = macdLine.dif.at(-2);
+      const prevDea = macdLine.dea.at(-2);
+      const rsi14 = lastValid(rsi(closes, 14));
+      const goldenCross = prevDif != null && prevDea != null && dif != null && dea != null && prevDif <= prevDea && dif > dea;
+      const deathCross = prevDif != null && prevDea != null && dif != null && dea != null && prevDif >= prevDea && dif < dea;
+      const recent = normalized.slice(-5);
+      const recentLow = recent.length ? Math.min(...recent.map((row) => row.low)) : last?.close || 0;
+      const previousLow = normalized.length > 6 ? Math.min(...normalized.slice(-6, -1).map((row) => row.low)) : recentLow;
+      const recentVolumes = recent.map((row) => row.volume).filter((value) => Number.isFinite(value) && value > 0);
+      const priorVolumes = normalized.slice(-10, -5).map((row) => row.volume).filter((value) => Number.isFinite(value) && value > 0);
+      const volumeRatio = priorVolumes.length && recentVolumes.length ? mean(recentVolumes) / mean(priorVolumes) : null;
+      const stopSignal = Boolean(last && previous && last.close < previous.close && last.close <= recentLow * 1.005);
+      const shrinkSignal = volumeRatio == null || volumeRatio <= 1.15;
+      const supportSignal = Boolean(last && previous && last.close >= previous.close * 0.995 && last.close >= last.open);
+      const stabilizeCount = [stopSignal, shrinkSignal, supportSignal].filter(Boolean).length;
+      const stabilizationLow = recentLow;
+      const stabilizeConfirmed = stabilizeCount >= 2 && Boolean(last && ma5 && last.close > ma5 && last.low >= stabilizationLow * 0.995);
+      const pressure5 = normalized.length ? Math.max(...normalized.slice(-5).map((row) => row.high)) : 0;
+      const aboveLongLine = Boolean(last && ma60 && last.close > ma60 && (!ma250 || last.close > ma250));
+      const topRisk = Boolean(last && previous && last.close > previous.close && rsi14 != null && rsi14 < 68 && deathCross);
+      const flowPositive = Number(fundFlow?.recent?.fiveMain) > 0 || (Number(fundFlow?.recent?.fiveMain) >= 0 && Number(fundFlow?.latest?.mainNet) > 0);
+      const flowNegative = Number(fundFlow?.recent?.fiveMain) < 0 && Number(fundFlow?.latest?.mainNet) < 0;
+      const invalidPrice = weekly?.stop || ma20 || ma60 ? last.close < Math.max(weekly?.stop || 0, (ma20 || 0) * 0.98, (ma60 || 0) * 0.92) : false;
+      const buyConfirmed = Boolean(
+        stage?.stageNo === 2
+        && aboveLongLine
+        && (stabilizeConfirmed || weekly?.buyReady || wave?.buyReady)
+        && (goldenCross || weekly?.buyReady || wave?.buyReady)
+      );
+      let selfAction = "观望";
+      let selfClass = "signal-wait";
+      let selfReason = "趋势、位置和动能没有同时形成确认，继续观察。";
+      if (invalidPrice || stage?.stageNo === 4) {
+        selfAction = "回避";
+        selfClass = "signal-risk";
+        selfReason = "跌破失效价或处于第四阶段下跌，不参与抄底。";
+      } else if (topRisk || deathCross || stage?.stageNo === 3) {
+        selfAction = "暂缓";
+        selfClass = "signal-watch";
+        selfReason = "日线动能转弱或进入第三阶段筑顶，不追高。";
+      } else if (buyConfirmed) {
+        selfAction = "买入";
+        selfClass = "signal-strong";
+        selfReason = "日线企稳确认，站上长期线，且金叉/周K买点成立。";
+      } else if (stabilizeCount >= 2 || (ma20 && last.close >= ma20 * 0.98)) {
+        selfAction = "接近买入";
+        selfClass = "signal-watch";
+        selfReason = `止跌、缩量、承接满足 ${stabilizeCount}/3，等待次日不破企稳低点并站上5日线。`;
+      } else if (last && pressure5 && last.close >= pressure5 * 0.98 && !flowPositive) {
+        selfAction = "不追高";
+        selfReason = "接近近5日压力位，但量能/资金没有同步确认。";
+      }
+      let holdingAction = selfAction === "买入" ? "加仓观察" : selfAction === "接近买入" ? "加仓/等待确认" : selfAction === "回避" ? "减仓/止损" : selfAction === "暂缓" ? "减仓观察" : "维持观察";
+      let holdingClass = selfClass;
+      let holdingReason = selfReason;
+      if (flowNegative && holdingAction === "加仓观察") {
+        holdingAction = "维持/不加仓";
+        holdingClass = "signal-watch";
+        holdingReason = "技术条件接近买点，但主力资金偏流出，暂不加仓。";
+      }
+      return {
+        selfAction, selfClass, selfReason,
+        holdingAction, holdingClass, holdingReason,
+        ma5, ma10, ma20, ma60, ma250, rsi14, volumeRatio,
+        goldenCross, deathCross, stabilizeCount, stabilizeConfirmed,
+        stabilizationLow, pressure5, invalidPrice, buyConfirmed
+      };
+    }
+
+    function buildHoldingExitAdvice(item, rows, stage, weekly, wave, fundFlow = null) {
+      const unified = buildUnifiedDecision(rows, item, stage, weekly, wave, fundFlow);
       const lastClose = rows.at(-1)?.close || item.lastClose || item.cost || 0;
       const cost = Number(item.cost) || 0;
       const pnl = cost ? lastClose / cost - 1 : null;
@@ -4663,6 +4757,13 @@
       let action = "继续持有";
       let alertLevel = 1;
       let reason = "买入逻辑尚未明显失效，继续观察 5/10 日线和板块热度。";
+      const fiveMain = Number(fundFlow?.recent?.fiveMain) || 0;
+      const latestMain = Number(fundFlow?.latest?.mainNet) || 0;
+      const fundPositive = fiveMain > 0 || (fiveMain >= 0 && latestMain > 0);
+      const fundNegative = fiveMain < 0 && latestMain < 0;
+      let dailyAction = unified.holdingAction;
+      let dailyActionClass = unified.holdingClass;
+      let dailyReason = unified.holdingReason;
 
       if (weekly?.stopLoss || (stage?.stageNo === 4) || (technicalStop && lastClose < technicalStop)) {
         alertLabel = "止损卖出";
@@ -4670,6 +4771,9 @@
         action = "优先卖出或降到很低仓位";
         alertLevel = 3;
         reason = `当前价 ${fmtNum.format(lastClose)} 跌破风险线 ${fmtNum.format(technicalStop)}，买入逻辑失效。`;
+        dailyAction = "减仓/止损";
+        dailyActionClass = "signal-risk";
+        dailyReason = "跌破风险线或处于第四阶段，不建议继续加仓。";
       } else if (stage?.stageNo === 3 || weekly?.takeProfit || (pnl != null && pnl >= 0.06)) {
         alertLabel = "止盈减仓";
         alertClass = "signal-watch";
@@ -4680,12 +4784,28 @@
           : pnl != null
             ? `当前浮盈 ${pct(pnl)}，进入 3%-10% 短线止盈观察区。`
             : "阶段有筑顶风险，适合先减仓。";
+        dailyAction = "减仓观察";
+        dailyActionClass = "signal-watch";
+        dailyReason = stage?.stageNo === 3 ? "进入第三阶段筑顶观察区，优先保护利润。" : "接近止盈或短线涨幅偏高，先降低追涨风险。";
       } else if (pnl != null && pnl <= -0.04) {
         alertLabel = "亏损预警";
         alertClass = "signal-risk";
         action = "靠近风险线，不能加仓";
         alertLevel = 2;
         reason = `当前浮亏 ${pct(pnl)}，若继续跌破 ${fmtNum.format(technicalStop)} 就触发止损。`;
+        dailyAction = "维持/不加仓";
+        dailyActionClass = "signal-risk";
+        dailyReason = "当前浮亏较大，先等重新站回关键线，不建议摊平加仓。";
+      } else if (stage?.stageNo === 2 && (weekly?.buyReady || fundPositive)) {
+        dailyAction = "加仓观察";
+        dailyActionClass = "signal-strong";
+        dailyReason = fundPositive
+          ? `第二阶段且资金偏流入，5日主力 ${formatSignedAmount(fiveMain)}，只考虑分批。`
+          : "第二阶段且周K进入买入区，只考虑小仓分批，不追涨。";
+      } else if (fundNegative) {
+        dailyAction = "维持/不加仓";
+        dailyActionClass = "signal-watch";
+        dailyReason = `主力资金偏流出，5日主力 ${formatSignedAmount(fiveMain)}，先观察承接。`;
       }
 
       return {
@@ -4697,6 +4817,10 @@
         alertLevel,
         action,
         reason,
+        dailyAction,
+        dailyActionClass,
+        dailyReason,
+        fundFlow,
         weeklyBoll: weekly,
         secondWave: wave,
         stopLine: technicalStop,
@@ -4710,7 +4834,7 @@
       const alert = state.portfolioStageAlert || {};
       const items = Array.isArray(alert.items) ? alert.items : [];
       if (alert.loading) {
-        $("portfolioStageAlert").innerHTML = "<strong>正在扫描卖点提醒</strong><span>正在逐只检查止损、止盈和趋势持有状态。</span>";
+        $("portfolioStageAlert").innerHTML = "<strong>正在生成今日持仓操作</strong><span>正在逐只检查加仓、维持、减仓和止损状态。</span>";
         return;
       }
       if (!items.length) {
@@ -4729,7 +4853,9 @@
       }).join("");
       const riskCount = items.filter((item) => item.alertClass === "signal-risk").length;
       const profitCount = items.filter((item) => item.alertClass === "signal-watch").length;
-      $("portfolioStageAlert").innerHTML = `<strong>卖点提醒：${riskCount} 只止损/预警，${profitCount} 只止盈，${items.length - riskCount - profitCount} 只持有</strong>${html}`;
+      const addCount = items.filter((item) => item.dailyAction === "加仓观察").length;
+      const reduceCount = items.filter((item) => item.dailyAction === "减仓观察" || item.dailyAction === "减仓/止损").length;
+      $("portfolioStageAlert").innerHTML = `<strong>今日持仓操作：${addCount} 只加仓观察，${items.length - addCount - reduceCount} 只维持，${reduceCount} 只减仓/止损</strong>${html}`;
     }
 
     async function refreshPortfolioStageAlert(force = false) {
@@ -4759,7 +4885,7 @@
       state.portfolioStageAlert = {
         ...cache,
         loading: true,
-        text: "正在扫描持仓卖点。",
+        text: "正在生成今日持仓操作。",
         items: cache.items || [],
         errors: []
       };
@@ -4773,7 +4899,15 @@
           const analysis = analyzeWeinsteinStage(rows);
           const weekly = analyzeWeeklyBollPullback(rows);
           const wave = analyzeLimitUpSecondWave(rows);
-          const advice = buildHoldingExitAdvice(item, rows, analysis, weekly, wave);
+          let fundFlow = null;
+          if (item.market === "cn") {
+            try {
+              fundFlow = await fetchStockFundFlow(item.symbol, item.market);
+            } catch (error) {
+              fundFlow = null;
+            }
+          }
+          const advice = buildHoldingExitAdvice(item, rows, analysis, weekly, wave, fundFlow);
           items.push(advice);
           item.lastClose = rows.at(-1)?.close || item.lastClose || item.cost || 0;
           item.updatedAt = new Date().toISOString();
@@ -4786,7 +4920,7 @@
       state.portfolioStageAlert = {
         updatedAt: Date.now(),
         loading: false,
-        text: items.length ? `已生成 ${items.length} 只持仓的卖点提醒。` : "暂无持仓卖点提醒。",
+        text: items.length ? `已生成 ${items.length} 只持仓的今日操作建议。` : "暂无持仓操作建议。",
         items,
         errors
       };
@@ -6035,11 +6169,27 @@
         try {
           const rows = await fetchMarketData(item.symbol, item.market, item.name || "");
           const holding = state.holdings.find((row) => storageKey(row) === storageKey(item));
-          const analysis = analyzeSignal(rows, holding);
+          const analysis = analyzeSignal(rows, null);
+          const weekly = analyzeWeeklyBollPullback(rows);
+          const wave = analyzeLimitUpSecondWave(rows);
+          let fundFlow = null;
+          if (item.market === "cn") {
+            try {
+              fundFlow = await fetchStockFundFlow(item.symbol, item.market);
+            } catch (error) {
+              fundFlow = null;
+            }
+          }
+          const unified = buildUnifiedDecision(rows, item, analysis.weinstein, weekly, wave, fundFlow);
           item.lastClose = rows.at(-1).close;
           item.score = analysis.score;
-          item.signal = analysis.signal;
-          item.action = analysis.action;
+          item.signal = unified.selfAction;
+          item.action = unified.selfReason;
+          item.decisionState = {
+            ...unified,
+            mode: holding ? "持仓" : "自选",
+            holdingAction: holding ? unified.holdingAction : undefined
+          };
           item.updatedAt = new Date().toISOString();
           item.error = "";
         } catch (error) {
@@ -6123,6 +6273,9 @@
       let totalMarket = 0;
       let totalCost = 0;
       const adviceMap = new Map((state.portfolioStageAlert?.items || []).map((item) => [storageKey(item), item]));
+      let addCount = 0;
+      let reduceCount = 0;
+      let holdCount = 0;
       $("holdingRows").innerHTML = state.holdings.map((item) => {
         const key = storageKey(item);
         const last = item.lastClose || 0;
@@ -6134,24 +6287,63 @@
         const adviceClass = advice?.alertClass || "signal-wait";
         const adviceLabel = advice?.alertLabel || "待检查";
         const adviceReason = advice?.reason || "点击“检查卖点”获取提醒";
+        const dailyActionClass = advice?.dailyActionClass || "signal-wait";
+        const dailyAction = advice?.dailyAction || "待检查";
+        const dailyReason = advice?.dailyReason || "点击“今日提醒”获取加减仓建议";
+        if (dailyAction === "加仓观察") addCount += 1;
+        else if (dailyAction.includes("减仓")) reduceCount += 1;
+        else holdCount += 1;
+        const trendText = advice?.stageLabel || "待检查";
+        const addLine = advice?.weeklyBoll?.ma20 || 0;
+        const reduceLine = advice?.takeProfitLine || 0;
+        const failLine = advice?.stopLine || 0;
         totalMarket += marketValue;
         totalCost += costValue;
         const cls = pnl >= 0 ? "positive" : "negative";
         return `<tr>
-          <td>${item.name || item.symbol}<br><span class="tag">${marketName(item.market)} ${item.symbol}</span></td>
-          <td>${fmtNum.format(item.shares)}</td>
-          <td>${fmtNum.format(item.cost)}</td>
-          <td class="${cls}">${fmtMoney.format(pnl)}<br>${pct(pnlPct)}</td>
-          <td><span class="tag ${adviceClass}">${escapeHtml(adviceLabel)}</span><br><span class="subtle">${escapeHtml(adviceReason)}</span></td>
+          <td><input type="checkbox" aria-label="选择 ${escapeHtml(item.name || item.symbol)}" /></td>
+          <td><strong>${escapeHtml(item.symbol)}</strong><br><span class="subtle">${escapeHtml(item.name || "-")}</span></td>
+          <td><span class="tag ${stageTone(advice?.stageNo || 0).cls}">${escapeHtml(trendText)}</span></td>
+          <td><span class="tag ${dailyActionClass}">${escapeHtml(dailyAction)}</span><br><span class="subtle">${escapeHtml(dailyReason)}</span><br><span class="subtle">${escapeHtml(adviceLabel)}：${escapeHtml(adviceReason)}</span></td>
+          <td>加仓 ${addLine ? fmtNum.format(addLine) : "-"}<br>减仓 ${reduceLine ? fmtNum.format(reduceLine) : "-"}<br>失效 ${failLine ? fmtNum.format(failLine) : "-"}</td>
+          <td class="${cls}"><strong>${last ? fmtNum.format(last) : "-"}</strong><br>${pct(pnlPct)}<br><span class="subtle">盈亏 ${fmtMoney.format(pnl)}</span></td>
+          <td>
+            <label class="subtle">股数</label>
+            <input class="holding-edit-input" data-field="shares" type="number" min="0" step="100" value="${Number(item.shares) || 0}" />
+            <label class="subtle">成本价</label>
+            <input class="holding-edit-input" data-field="cost" type="number" min="0" step="0.01" value="${Number(item.cost) || 0}" />
+            <button class="tiny-button" data-action="save-holding" data-key="${key}">保存持仓</button>
+          </td>
           <td>
             <button class="tiny-button" data-action="load-holding" data-key="${key}">加载</button>
             <button class="tiny-button" data-action="remove-holding" data-key="${key}">删除</button>
           </td>
         </tr>`;
-      }).join("") || `<tr><td colspan="6" style="text-align:left;color:var(--muted)">暂无持仓记录</td></tr>`;
+      }).join("") || `<tr><td colspan="8" style="text-align:left;color:var(--muted)">暂无持仓记录</td></tr>`;
       const totalPnl = totalMarket - totalCost;
       $("holdingSummary").textContent = state.holdings.length ? `市值 ${fmtMoney.format(totalMarket)} / 浮盈 ${fmtMoney.format(totalPnl)}` : "未记录";
+      $("holdingActionSummary").textContent = state.holdings.length
+        ? `加仓/买点 ${addCount} 只　减仓/风控 ${reduceCount} 只　持有/观察 ${holdCount} 只　| 日线数据更新后自动生成`
+        : "点击“今日提醒”生成加仓、维持、减仓建议。";
       renderPortfolioRisk();
+    }
+
+    function saveHoldingRow(key, row) {
+      const item = state.holdings.find((holding) => storageKey(holding) === key);
+      if (!item) return;
+      const shares = Number(row.querySelector('[data-field="shares"]')?.value);
+      const cost = Number(row.querySelector('[data-field="cost"]')?.value);
+      if (!(shares >= 0) || !(cost > 0)) {
+        $("statusText").textContent = "请填写有效的股数和成本价";
+        return;
+      }
+      item.shares = shares;
+      item.cost = cost;
+      item.updatedAt = new Date().toISOString();
+      saveSaved("quant_holdings", state.holdings);
+      renderSavedStocks();
+      void refreshPortfolioStageAlert(true);
+      $("statusText").textContent = `${item.name || item.symbol} 持仓信息已保存`;
     }
 
     function renderRecommendations() {
@@ -6825,6 +7017,7 @@
       if (!button) return;
       const action = button.dataset.action;
       if (action === "load-holding") loadSavedSymbol(button.dataset.key, "holding");
+      if (action === "save-holding") saveHoldingRow(button.dataset.key, button.closest("tr"));
       if (action === "remove-holding") removeSaved("holding", button.dataset.key);
     });
     $("recommendRows").addEventListener("click", (event) => {
